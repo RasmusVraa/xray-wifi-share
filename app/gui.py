@@ -66,6 +66,14 @@ class App(ctk.CTk):
         self._fade_cards: list[ctk.CTkFrame] = []
 
         ensure_dirs()
+        # Don't show a stale error from the previous failed run
+        try:
+            if STATUS_FILE.exists():
+                old = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+                if str(old.get("state") or "") in ("error", "stopped", "killed"):
+                    STATUS_FILE.unlink()
+        except Exception:
+            pass
         self._build()
         self.refresh_adapters()
         self._follow_log_from_end()
