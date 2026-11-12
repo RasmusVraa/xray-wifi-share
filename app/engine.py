@@ -198,6 +198,8 @@ class Engine:
         self._state.private_adapter = hs.private_adapter
         self._log(f"Wi‑Fi точка: SSID={hs.ssid}  адаптер={hs.private_adapter}")
 
+        # SoftAP vNIC needs a moment before HNetCfg accepts EnableSharing
+        time.sleep(1.2)
         self._apply_ics(tun_adapter, hs.private_adapter)
         self._log("Готово. Подключай устройство к Wi‑Fi точке.")
         self._log("Ожидание подключений…")
@@ -236,15 +238,13 @@ class Engine:
             try:
                 self._apply_ics(tun_adapter, private)
             except Exception as exc:
-                self._log(f"ICS re-apply: {exc}")
-                # SoftAP may have dropped — restart hotspot
+                # Don't fail reconnect if tunnel probe is OK — ICS may already be up
+                self._log(f"WARN ICS re-apply: {exc}")
                 try:
-                    hs = hotspot.configure_and_start(req.ssid, req.password)
-                    self._state.private_adapter = hs.private_adapter
-                    self._apply_ics(tun_adapter, hs.private_adapter)
-                except Exception as exc2:
-                    self._log(f"Hotspot recovery failed: {exc2}")
-                    raise
+                    cur_pub, cur_priv = ics.current_sharing()
+                    self._log(f"ICS сейчас: public={cur_pub} private={cur_priv}")
+                except Exception:
+                    pass
 
         if self._state.bypass_ips and self._state.uplink:
             add_host_routes(self._state.bypass_ips, self._state.uplink)

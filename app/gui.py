@@ -1039,12 +1039,17 @@ class App(ctk.CTk):
             body = msg.split("]", 1)[-1].strip()
             if any(x in low for x in ("error", "failed", "fatal", "ошиб")):
                 return "ERROR", body or msg
-            if "warn" in low:
+            if "warn" in low or "[warning]" in low:
                 return "WARN", body or msg
             return "DEBUG", body or msg
+        # Fragments from tun2socks JSON logs that leaked without tag
+        if re.search(r'(->|=>)\s*\d+\.\d+\.\d+\.\d+:\d+|":\d+"}', msg):
+            return "DEBUG", msg
+        if "access a socket in a way forbidden" in low:
+            return "DEBUG", msg
         if any(x in low for x in ("ошиб", "error", "failed", "fatal")):
             return "ERROR", msg
-        if "warn" in low or "⚠" in msg:
+        if "warn" in low or "⚠" in msg or "[warning]" in low:
             return "WARN", msg
         return "INFO", msg
 

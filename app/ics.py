@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import time
 from contextlib import contextmanager
 from typing import Iterable, Iterator
+
+from .netutil import run_ps
 
 try:
     import pythoncom  # type: ignore
@@ -27,13 +30,9 @@ def _com_initialized() -> Iterator[None]:
     _require_win32()
     initialized = False
     try:
-        # COINIT_APARTMENTTHREADED — HNetCfg expects STA
-        hr = pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
-        # S_OK (0) or S_FALSE (1) — both mean COM is usable on this thread
+        pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
         initialized = True
-        _ = hr
     except Exception as exc:
-        # Already initialized with different mode, etc.
         raise RuntimeError(f"CoInitialize failed: {exc}") from exc
     try:
         yield
@@ -43,6 +42,42 @@ def _com_initialized() -> Iterator[None]:
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+
+
+def _ensure_shared_access() -> None:
+    """SharedAccess must be running or EnableSharing returns 0x80040201."""
+    ps = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$svc = Get-Service SharedAccess -ErrorAction SilentlyContinue
+if ($null -eq $svc) { return }
+if ($svc.StartType -eq 'Disabled') {
+  Set-Service SharedAccess -StartupType Manual -ErrorAction SilentlyContinue
+}
+if ($svc.Status -ne 'Running') {
+  Start-Service SharedAccess -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 800
+}
+# Touch hnetcfg registration (harmless if already registered)
+regsvr32 /s hnetcfg.dll | Out-Null
+"""
+    run_ps(ps)
+
+
+def _cleanup_wmi_sharing() -> None:
+    """Stale WMI ICS entries cause EnableSharing 0x80040201 on Win10/11."""
+    ps = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance -Namespace root\Microsoft\HomeNet -ClassName HNet_ConnectionProperties -ErrorAction SilentlyContinue |
+  Where-Object { $_.IsIcsPrivate -or $_.IsIcsPublic } |
+  ForEach-Object {
+    try {
+      $_.IsIcsPrivate = $false
+      $_.IsIcsPublic = $false
+      Set-CimInstance -InputObject $_ -ErrorAction SilentlyContinue
+    } catch {}
+  }
+"""
+    run_ps(ps)
 
 
 def _connections():
@@ -55,14 +90,20 @@ def _connections():
         yield hnet, conn, props, cfg
 
 
+def _disable_all_locked() -> None:
+    for _hnet, _conn, _props, cfg in _connections():
+        try:
+            if cfg.SharingEnabled:
+                cfg.DisableSharing()
+        except Exception:
+            pass
+
+
 def disable_all_sharing() -> None:
+    _ensure_shared_access()
     with _com_initialized():
-        for _hnet, _conn, _props, cfg in _connections():
-            try:
-                if cfg.SharingEnabled:
-                    cfg.DisableSharing()
-            except Exception:
-                pass
+        _disable_all_locked()
+    time.sleep(0.6)
 
 
 def list_shareable_names() -> list[str]:
@@ -76,28 +117,98 @@ def list_shareable_names() -> list[str]:
     return names
 
 
-def enable_sharing(public_name: str, private_name: str) -> None:
-    """Share public_name (VPN TUN) to private_name (hotspot)."""
+def current_sharing() -> tuple[str | None, str | None]:
+    """Return (public_name, private_name) currently shared, if any."""
+    public = None
+    private = None
     with _com_initialized():
-        # disable inside same COM apartment
-        for _hnet, _conn, _props, cfg in _connections():
+        for _hnet, _conn, props, cfg in _connections():
             try:
-                if cfg.SharingEnabled:
-                    cfg.DisableSharing()
+                if not cfg.SharingEnabled:
+                    continue
+                name = str(props.Name)
+                # SharingConnectionType: 0 public, 1 private
+                typ = int(getattr(cfg, "SharingConnectionType", -1))
+                if typ == ICSS_PUBLIC:
+                    public = name
+                elif typ == ICSS_PRIVATE:
+                    private = name
             except Exception:
-                pass
+                continue
+    return public, private
+
+
+def enable_sharing(public_name: str, private_name: str) -> None:
+    """Share public_name (VPN TUN) to private_name (hotspot). Retries around 0x80040201."""
+    _ensure_shared_access()
+
+    # Already correct — don't poke ICS (reconnect path)
+    cur_pub, cur_priv = current_sharing()
+    if cur_pub == public_name and cur_priv == private_name:
+        return
+
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            _enable_once(public_name, private_name, hard_reset=(attempt > 1))
+            # verify
+            cur_pub, cur_priv = current_sharing()
+            if cur_pub == public_name and cur_priv == private_name:
+                return
+            # Some Windows builds report type oddly — accept if both enabled names match intent
+            if cur_pub and cur_priv:
+                if _norm(cur_pub) == _norm(public_name) and _norm(cur_priv) == _norm(private_name):
+                    return
+            last_exc = RuntimeError(
+                f"ICS включился неверно: public={cur_pub!r} private={cur_priv!r}"
+            )
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(0.8 * attempt)
+
+    raise RuntimeError(f"ICS EnableSharing failed: {last_exc}")
+
+
+def _enable_once(public_name: str, private_name: str, hard_reset: bool) -> None:
+    if hard_reset:
+        _cleanup_wmi_sharing()
+        _ensure_shared_access()
+        # bounce SharedAccess on stubborn 0x80040201
+        run_ps(
+            r"""
+$ErrorActionPreference='SilentlyContinue'
+Restart-Service SharedAccess -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+"""
+        )
+
+    with _com_initialized():
+        _disable_all_locked()
+        time.sleep(0.8)
 
         public_cfg = None
         private_cfg = None
+        public_conn = None
+        private_conn = None
         seen: list[str] = []
 
-        for _hnet, _conn, props, cfg in _connections():
+        # Re-enumerate after disable (handles stale COM refs)
+        items = list(_connections())
+        for _hnet, conn, props, cfg in items:
             name = str(props.Name)
             seen.append(name)
-            if name == public_name:
+            if name == public_name or _norm(name) == _norm(public_name):
                 public_cfg = cfg
-            elif name == private_name:
+                public_conn = conn
+            if name == private_name or _norm(name) == _norm(private_name):
                 private_cfg = cfg
+                private_conn = conn
+            # star-suffix fallback for private
+            if private_cfg is None and _star_suffix(private_name) and _star_suffix(name) == _star_suffix(
+                private_name
+            ):
+                private_cfg = cfg
+                private_conn = conn
 
         if public_cfg is None or private_cfg is None:
             raise RuntimeError(
@@ -106,8 +217,36 @@ def enable_sharing(public_name: str, private_name: str) -> None:
                 f"Доступны: {', '.join(seen)}"
             )
 
-        public_cfg.EnableSharing(ICSS_PUBLIC)
-        private_cfg.EnableSharing(ICSS_PRIVATE)
+        # Order: private first then public — more reliable on Win11
+        try:
+            private_cfg.EnableSharing(ICSS_PRIVATE)
+            time.sleep(0.35)
+            public_cfg.EnableSharing(ICSS_PUBLIC)
+        except Exception:
+            # fallback: public then private
+            time.sleep(0.5)
+            _disable_all_locked()
+            time.sleep(0.5)
+            # refresh configs
+            items = list(_connections())
+            public_cfg = private_cfg = None
+            for _hnet, conn, props, cfg in items:
+                name = str(props.Name)
+                if name == public_name or _norm(name) == _norm(public_name):
+                    public_cfg = cfg
+                if name == private_name or _norm(name) == _norm(private_name):
+                    private_cfg = cfg
+                if private_cfg is None and _star_suffix(private_name) and _star_suffix(name) == _star_suffix(
+                    private_name
+                ):
+                    private_cfg = cfg
+            if public_cfg is None or private_cfg is None:
+                raise
+            public_cfg.EnableSharing(ICSS_PUBLIC)
+            time.sleep(0.35)
+            private_cfg.EnableSharing(ICSS_PRIVATE)
+
+        _ = (public_conn, private_conn)
 
 
 def _norm(s: str) -> str:
