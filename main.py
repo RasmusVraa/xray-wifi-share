@@ -8,13 +8,18 @@ def main() -> int:
         print("Только Windows")
         return 1
 
+    from app.admin import is_admin, relaunch_as_admin
+
+    # Always run elevated: SoftAP / ICS / tun2socks need admin.
+    if not is_admin():
+        relaunch_as_admin()
+        return 0
+
     if "--job" in sys.argv:
         from app.elevated_job import run_job
 
         return run_job()
 
-    # GUI runs without forced UAC so clipboard paste works.
-    # Privileged start/stop/kill are launched via UAC separately.
     from app.gui import run_app
 
     run_app()

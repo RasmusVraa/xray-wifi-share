@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -20,17 +21,19 @@ from .remnawave import parse_servers
 from .settings import load_settings, save_settings
 
 
-BG = "#12151C"
-CARD = "#1B212C"
-FIELD = "#10151D"
-STROKE = "#2C3545"
+BG = "#0E1218"
+CARD = "#161C26"
+FIELD = "#0B1017"
+STROKE = "#2A3344"
 TEXT = "#E8EDF5"
 MUTED = "#8B95A8"
+HINT = "#6F7A8C"
 ACCENT = "#1FAE70"
-ACCENT_HOVER = "#1A9660"
+ACCENT_HOVER = "#19975F"
 DANGER = "#C44B4B"
 WARN = "#D3A23A"
 PILL_IDLE = "#C9A227"
+INFO_GREEN = "#2EE59D"
 
 
 class App(ctk.CTk):
@@ -40,8 +43,8 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("Xray Wi‑Fi Share")
-        self.geometry("920x820")
-        self.minsize(820, 720)
+        self.geometry("960x860")
+        self.minsize(860, 740)
         self.configure(fg_color=BG)
 
         self.engine = Engine()
@@ -50,6 +53,7 @@ class App(ctk.CTk):
         self._show_password = False
         self._log_offset = 0
         self._poll_after: str | None = None
+        self._anim_after: str | None = None
         self._last_status = ""
         self._last_error_shown = ""
         self._adapters_raw: list = []
@@ -57,24 +61,34 @@ class App(ctk.CTk):
         self._servers: list[ParsedLink] = []
         self._saved_server = ""
         self._parse_token = 0
+        self._log_mode = "brief"
+        self._pill_pulse = 0
+        self._fade_cards: list[ctk.CTkFrame] = []
 
         ensure_dirs()
         self._build()
         self.refresh_adapters()
         self._follow_log_from_end()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.after(200, self._focus_link)
-        self.after(300, self._start_polling)
+        self.after(120, self._focus_link)
+        self.after(180, self._start_polling)
+        self.after(40, self._run_intro_animation)
+        if is_admin():
+            self._ui_log("INFO", "Запущено с правами администратора")
+        else:
+            self._ui_log("WARN", "Нет прав администратора — сетевые операции могут падать")
 
     def _card(self, parent: ctk.CTkFrame) -> ctk.CTkFrame:
-        return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=STROKE)
+        frame = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=16, border_width=1, border_color=STROKE)
+        self._fade_cards.append(frame)
+        return frame
 
     def _build(self) -> None:
-        shell = ctk.CTkFrame(self, fg_color=BG)
-        shell.pack(fill="both", expand=True, padx=22, pady=18)
+        self.shell = ctk.CTkFrame(self, fg_color=BG)
+        self.shell.pack(fill="both", expand=True, padx=22, pady=18)
 
         # —— Header ——
-        head = ctk.CTkFrame(shell, fg_color="transparent")
+        head = ctk.CTkFrame(self.shell, fg_color="transparent")
         head.pack(fill="x")
 
         title_row = ctk.CTkFrame(head, fg_color="transparent")
@@ -102,8 +116,8 @@ class App(ctk.CTk):
             text_color=MUTED,
         ).pack(anchor="w", pady=(2, 0))
 
-        # —— Card: connection settings ——
-        conn = self._card(shell)
+        # —— Connection ——
+        conn = self._card(self.shell)
         conn.pack(fill="x", pady=(16, 10))
         conn_in = ctk.CTkFrame(conn, fg_color="transparent")
         conn_in.pack(fill="x", padx=18, pady=16)
@@ -120,7 +134,6 @@ class App(ctk.CTk):
         cols.columnconfigure(0, weight=3)
         cols.columnconfigure(1, weight=2)
 
-        # left: link + servers
         left = ctk.CTkFrame(cols, fg_color="transparent")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         ctk.CTkLabel(left, text="Ссылка / URL подписки / Raw JSON", text_color=MUTED).pack(anchor="w")
@@ -129,40 +142,48 @@ class App(ctk.CTk):
         link_row.pack(fill="x", pady=(6, 0))
         self.link_entry = ctk.CTkEntry(
             link_row,
-            height=40,
+            height=42,
             fg_color=FIELD,
             border_color=STROKE,
             text_color=TEXT,
-            placeholder_text="vless://…  ·  https://sub…  ·  {\"resolvedProxyConfigs\":…}",
+            placeholder_text="vless://uuid@server:443?...  ·  https://sub…  ·  JSON",
             font=ctk.CTkFont(family="Cascadia Mono", size=12),
         )
         self.link_entry.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(
+        self.paste_btn = ctk.CTkButton(
             link_row,
             text="⧉  Вставить",
-            width=100,
-            height=40,
+            width=108,
+            height=42,
             fg_color=STROKE,
             hover_color="#364257",
             command=self.paste_link,
-        ).pack(side="left", padx=(8, 0))
+        )
+        self.paste_btn.pack(side="left", padx=(8, 0))
         self.load_btn = ctk.CTkButton(
             link_row,
             text="Загрузить",
-            width=100,
-            height=40,
+            width=108,
+            height=42,
             fg_color=STROKE,
             hover_color="#364257",
             command=self.load_servers,
         )
         self.load_btn.pack(side="left", padx=(8, 0))
 
-        srv_row = ctk.CTkFrame(left, fg_color="transparent")
-        srv_row.pack(fill="x", pady=(10, 0))
-        ctk.CTkLabel(srv_row, text="Сервер", text_color=MUTED).pack(anchor="w")
+        ctk.CTkLabel(
+            left,
+            text="Ссылка, URL подписки Remnawave или Raw JSON — затем выбери сервер",
+            text_color=HINT,
+            font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", pady=(6, 0))
+
+        srv = ctk.CTkFrame(left, fg_color="transparent")
+        srv.pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(srv, text="Сервер", text_color=MUTED).pack(anchor="w")
         self.server_var = tk.StringVar(value="— загрузи ссылку / JSON —")
         self.server_menu = ctk.CTkOptionMenu(
-            srv_row,
+            srv,
             variable=self.server_var,
             values=["— загрузи ссылку / JSON —"],
             height=40,
@@ -174,9 +195,9 @@ class App(ctk.CTk):
         )
         self.server_menu.pack(fill="x", pady=(6, 0))
         self.server_hint = ctk.CTkLabel(
-            srv_row,
-            text="Список серверов появится после загрузки подписки",
-            text_color="#6F7A8C",
+            srv,
+            text="Список серверов появится после загрузки",
+            text_color=HINT,
             font=ctk.CTkFont(size=11),
             anchor="w",
         )
@@ -188,7 +209,6 @@ class App(ctk.CTk):
         self.link_entry.bind("<Shift-Insert>", self._on_ctrl_v)
         self.link_entry.bind("<Return>", lambda _e: self.load_servers())
 
-        # right: adapter
         right = ctk.CTkFrame(cols, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
         ad_top = ctk.CTkFrame(right, fg_color="transparent")
@@ -210,7 +230,7 @@ class App(ctk.CTk):
             right,
             variable=self.adapter_var,
             values=["—"],
-            height=40,
+            height=42,
             fg_color=FIELD,
             button_color=STROKE,
             button_hover_color="#364257",
@@ -222,14 +242,14 @@ class App(ctk.CTk):
         self.adapter_hint = ctk.CTkLabel(
             right,
             text="Проверка режима точки доступа…",
-            text_color="#6F7A8C",
+            text_color=HINT,
             font=ctk.CTkFont(size=12),
             anchor="w",
         )
         self.adapter_hint.pack(fill="x", pady=(8, 0))
 
-        # —— Card: hotspot params ——
-        ap = self._card(shell)
+        # —— Hotspot ——
+        ap = self._card(self.shell)
         ap.pack(fill="x", pady=(0, 10))
         ap_in = ctk.CTkFrame(ap, fg_color="transparent")
         ap_in.pack(fill="x", padx=18, pady=16)
@@ -249,7 +269,7 @@ class App(ctk.CTk):
         ssid_f = ctk.CTkFrame(ap_grid, fg_color="transparent")
         ssid_f.grid(row=0, column=0, sticky="ew", padx=(0, 12))
         ctk.CTkLabel(ssid_f, text="SSID (имя сети)", text_color=MUTED).pack(anchor="w")
-        self.ssid_entry = ctk.CTkEntry(ssid_f, height=40, fg_color=FIELD, border_color=STROKE)
+        self.ssid_entry = ctk.CTkEntry(ssid_f, height=42, fg_color=FIELD, border_color=STROKE)
         self.ssid_entry.pack(fill="x", pady=(6, 0))
 
         pw_f = ctk.CTkFrame(ap_grid, fg_color="transparent")
@@ -257,13 +277,13 @@ class App(ctk.CTk):
         ctk.CTkLabel(pw_f, text="Пароль (минимум 8 символов)", text_color=MUTED).pack(anchor="w")
         pw_row = ctk.CTkFrame(pw_f, fg_color="transparent")
         pw_row.pack(fill="x", pady=(6, 0))
-        self.pass_entry = ctk.CTkEntry(pw_row, height=40, fg_color=FIELD, border_color=STROKE, show="•")
+        self.pass_entry = ctk.CTkEntry(pw_row, height=42, fg_color=FIELD, border_color=STROKE, show="•")
         self.pass_entry.pack(side="left", fill="x", expand=True)
         self.show_pw_btn = ctk.CTkButton(
             pw_row,
             text="Показать",
             width=100,
-            height=40,
+            height=42,
             fg_color=STROKE,
             hover_color="#364257",
             command=self.toggle_password,
@@ -271,13 +291,14 @@ class App(ctk.CTk):
         self.show_pw_btn.pack(side="left", padx=(8, 0))
 
         # —— Actions ——
-        actions = ctk.CTkFrame(shell, fg_color="transparent")
+        actions = ctk.CTkFrame(self.shell, fg_color="transparent")
         actions.pack(fill="x", pady=(2, 10))
 
         self.start_btn = ctk.CTkButton(
             actions,
             text="⏻   Запустить",
-            height=46,
+            height=48,
+            corner_radius=12,
             fg_color=ACCENT,
             hover_color=ACCENT_HOVER,
             font=ctk.CTkFont(family="Segoe UI Semibold", size=14),
@@ -288,7 +309,8 @@ class App(ctk.CTk):
         self.stop_btn = ctk.CTkButton(
             actions,
             text="■   Остановить",
-            height=46,
+            height=48,
+            corner_radius=12,
             fg_color="transparent",
             border_width=1,
             border_color=STROKE,
@@ -302,7 +324,8 @@ class App(ctk.CTk):
         self.kill_btn = ctk.CTkButton(
             actions,
             text="☠   Принудительно завершить",
-            height=46,
+            height=48,
+            corner_radius=12,
             fg_color="transparent",
             border_width=1,
             border_color=STROKE,
@@ -313,7 +336,7 @@ class App(ctk.CTk):
         self.kill_btn.pack(side="left", fill="x", expand=True)
 
         # —— Log ——
-        log_card = self._card(shell)
+        log_card = self._card(self.shell)
         log_card.pack(fill="both", expand=True)
         log_in = ctk.CTkFrame(log_card, fg_color="transparent")
         log_in.pack(fill="both", expand=True, padx=14, pady=12)
@@ -326,6 +349,21 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI Semibold", size=14),
             text_color=TEXT,
         ).pack(side="left")
+
+        self.log_mode_var = tk.StringVar(value="Краткий")
+        self.log_mode_menu = ctk.CTkSegmentedButton(
+            log_head,
+            values=["Краткий", "Debug"],
+            variable=self.log_mode_var,
+            height=28,
+            selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=STROKE,
+            unselected_hover_color="#364257",
+            command=self._on_log_mode,
+        )
+        self.log_mode_menu.pack(side="left", padx=(14, 0))
+
         ctk.CTkButton(
             log_head,
             text="🗑  Очистить",
@@ -343,17 +381,20 @@ class App(ctk.CTk):
             log_in,
             fg_color=FIELD,
             border_color=STROKE,
-            text_color="#C9D3E2",
+            text_color=TEXT,
             font=ctk.CTkFont(family="Cascadia Mono", size=12),
             activate_scrollbars=True,
+            corner_radius=10,
         )
         self.log_box.pack(fill="both", expand=True, pady=(8, 0))
         tb = self.log_box._textbox  # noqa: SLF001
-        tb.tag_configure("muted", foreground="#6F7A8C")
-        tb.tag_configure("info", foreground=ACCENT)
+        tb.tag_configure("time", foreground="#C9D3E2")
+        tb.tag_configure("info", foreground=INFO_GREEN)
         tb.tag_configure("warn", foreground=WARN)
         tb.tag_configure("error", foreground=DANGER)
-        tb.tag_configure("plain", foreground="#C9D3E2")
+        tb.tag_configure("debug", foreground=HINT)
+        tb.tag_configure("msg", foreground="#E8EDF5")
+        tb.tag_configure("sep", foreground=HINT)
         self.log_box.configure(state="disabled")
 
         self._apply_settings()
@@ -361,8 +402,53 @@ class App(ctk.CTk):
         self.pass_entry.bind("<FocusOut>", lambda _e: self._persist_settings())
         self.link_entry.bind("<FocusOut>", lambda _e: self._persist_settings())
         if self.link_entry.get().strip():
-            self.after(500, self.load_servers)
+            self.after(450, self.load_servers)
 
+    # —— animations ——
+    def _run_intro_animation(self) -> None:
+        # soft fade-in by briefly dimming then restoring card borders
+        for i, card in enumerate(self._fade_cards):
+            delay = 40 + i * 70
+            self.after(delay, lambda c=card: self._flash_card(c))
+        self.after(80, lambda: self._pulse_button(self.start_btn, cycles=3))
+
+    def _flash_card(self, card: ctk.CTkFrame) -> None:
+        try:
+            card.configure(border_color=ACCENT)
+            self.after(180, lambda: card.configure(border_color=STROKE))
+        except Exception:
+            pass
+
+    def _pulse_button(self, btn: ctk.CTkButton, cycles: int = 2) -> None:
+        if cycles <= 0:
+            return
+
+        def restore() -> None:
+            try:
+                btn.configure(fg_color=ACCENT)
+            except Exception:
+                pass
+            self.after(120, lambda: self._pulse_button(btn, cycles - 1))
+
+        try:
+            btn.configure(fg_color=ACCENT_HOVER)
+            self.after(120, restore)
+        except Exception:
+            pass
+
+    def _pulse_status(self) -> None:
+        if not self._running:
+            self._anim_after = None
+            return
+        self._pill_pulse = 1 - self._pill_pulse
+        color = ACCENT if self._pill_pulse else "#168A58"
+        try:
+            self.status_pill.configure(fg_color=color)
+        except Exception:
+            pass
+        self._anim_after = self.after(700, self._pulse_status)
+
+    # —— settings ——
     def _apply_settings(self) -> None:
         cfg = load_settings()
         if cfg.get("link"):
@@ -380,6 +466,9 @@ class App(ctk.CTk):
         self.show_pw_btn.configure(text="Скрыть" if self._show_password else "Показать")
         self._saved_adapter = str(cfg.get("adapter") or "")
         self._saved_server = str(cfg.get("selected_server") or "")
+        mode = str(cfg.get("log_mode") or "brief")
+        self._log_mode = "debug" if mode == "debug" else "brief"
+        self.log_mode_var.set("Debug" if self._log_mode == "debug" else "Краткий")
 
     def _persist_settings(self) -> None:
         save_settings(
@@ -390,8 +479,14 @@ class App(ctk.CTk):
                 "adapter": self.adapter_var.get(),
                 "show_password": self._show_password,
                 "selected_server": self.server_var.get() if self._servers else self._saved_server,
+                "log_mode": self._log_mode,
             }
         )
+
+    def _on_log_mode(self, value: str) -> None:
+        self._log_mode = "debug" if value == "Debug" else "brief"
+        self._persist_settings()
+        self._ui_log("INFO", f"Режим лога: {'Debug' if self._log_mode == 'debug' else 'краткий'}")
 
     def _focus_link(self) -> None:
         try:
@@ -416,6 +511,7 @@ class App(ctk.CTk):
         self.link_entry.delete(0, "end")
         self.link_entry.insert(0, text.strip())
         self._persist_settings()
+        self._flash_card(self._fade_cards[0] if self._fade_cards else self.shell)
         self.load_servers()
 
     def _on_ctrl_v(self, _event=None):
@@ -440,7 +536,8 @@ class App(ctk.CTk):
         self._parse_token += 1
         token = self._parse_token
         self.load_btn.configure(state="disabled", text="…")
-        self.server_hint.configure(text="Загрузка списка серверов…", text_color="#6F7A8C")
+        self.server_hint.configure(text="Загрузка списка серверов…", text_color=HINT)
+        self._ui_log("INFO", "Загрузка подписки…")
 
         def worker() -> None:
             err = ""
@@ -456,9 +553,10 @@ class App(ctk.CTk):
                 self.load_btn.configure(state="normal", text="Загрузить")
                 if err:
                     self._set_servers([], hint=f"Не разобрать: {err}")
-                    self._append_log(f"Подписка: {err}")
+                    self._ui_log("ERROR", f"Подписка: {err}")
                     return
                 self._set_servers(servers)
+                self._ui_log("INFO", f"Серверов: {len(servers)}")
 
             try:
                 self.after(0, done)
@@ -469,8 +567,9 @@ class App(ctk.CTk):
 
     def _server_label(self, item: ParsedLink, index: int) -> str:
         proto = item.kind.upper().replace("HYSTERIA2", "HY2").replace("HYSTERIA", "HY2")
+        if proto in ("SS", "SHADOWSOCKS"):
+            proto = "SS"
         remark = item.remark or f"{item.server_host}:{item.server_port}"
-        # keep unique labels for OptionMenu
         return f"{index + 1}. [{proto}] {remark}"
 
     def _set_servers(self, servers: list[ParsedLink], hint: str | None = None) -> None:
@@ -479,15 +578,11 @@ class App(ctk.CTk):
             empty = "— нет серверов —"
             self.server_menu.configure(values=[empty])
             self.server_var.set(empty)
-            self.server_hint.configure(
-                text=hint or "Серверов не найдено",
-                text_color=WARN,
-            )
+            self.server_hint.configure(text=hint or "Серверов не найдено", text_color=WARN)
             return
 
         labels = [self._server_label(s, i) for i, s in enumerate(servers)]
         self.server_menu.configure(values=labels)
-
         chosen = labels[0]
         saved = self._saved_server
         if saved:
@@ -496,10 +591,7 @@ class App(ctk.CTk):
                     chosen = lab
                     break
         self.server_var.set(chosen)
-        self.server_hint.configure(
-            text=hint or f"Доступно серверов: {len(servers)}",
-            text_color=ACCENT,
-        )
+        self.server_hint.configure(text=hint or f"Доступно серверов: {len(servers)}", text_color=ACCENT)
         self._on_server_changed()
 
     def _on_server_changed(self) -> None:
@@ -528,15 +620,10 @@ class App(ctk.CTk):
         try:
             adapters = self.engine.wifi_adapters()
         except Exception as exc:
-            self._append_log(f"Адаптеры: {exc}")
+            self._ui_log("WARN", f"Адаптеры: {exc}")
             adapters = []
         self._adapters_raw = adapters
-        values = []
-        for a in adapters:
-            # cleaner label like the mockup
-            values.append(a.description or a.name)
-        if not values:
-            values = ["Wi‑Fi адаптер не найден"]
+        values = [a.description or a.name for a in adapters] or ["Wi‑Fi адаптер не найден"]
         self.adapter_menu.configure(values=values)
 
         preferred = self._saved_adapter or ""
@@ -546,7 +633,6 @@ class App(ctk.CTk):
                 if preferred == item or preferred in item or item in preferred:
                     chosen = item
                     break
-            # also match old "name · desc" format
             for a in adapters:
                 label = a.description or a.name
                 old = f"{a.name}  ·  {a.description}"
@@ -559,10 +645,7 @@ class App(ctk.CTk):
     def _on_adapter_changed(self) -> None:
         label = self.adapter_var.get()
         if "не найден" in label.lower():
-            self.adapter_hint.configure(
-                text="⚠  Подключи USB Wi‑Fi адаптер",
-                text_color=WARN,
-            )
+            self.adapter_hint.configure(text="⚠  Подключи USB Wi‑Fi адаптер", text_color=WARN)
             return
         supported = self._softap_supported()
         if supported is True:
@@ -576,25 +659,17 @@ class App(ctk.CTk):
                 text_color=WARN,
             )
         else:
-            self.adapter_hint.configure(
-                text="?  Не удалось проверить SoftAP",
-                text_color="#6F7A8C",
-            )
+            self.adapter_hint.configure(text="?  Не удалось проверить SoftAP", text_color=HINT)
         self._persist_settings()
 
     def _softap_supported(self) -> bool | None:
         try:
             r = run_cmd(["netsh", "wlan", "show", "drivers"])
-            text = f"{r.stdout}\n{r.stderr}".lower()
-            if "hosted network supported  : yes" in text or "поддержка размещенной сети  : да" in text.replace(
-                "ё", "е"
-            ):
+            text = f"{r.stdout}\n{r.stderr}".lower().replace("ё", "е")
+            if "hosted network supported  : yes" in text or "поддержка размещенной сети  : да" in text:
                 return True
-            if "hosted network supported  : no" in text or "поддержка размещенной сети  : нет" in text.replace(
-                "ё", "е"
-            ):
+            if "hosted network supported  : no" in text or "поддержка размещенной сети  : нет" in text:
                 return False
-            # looser match
             if "размещенной сети" in text and "да" in text:
                 return True
             if "hosted network supported" in text and "yes" in text:
@@ -621,10 +696,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Ссылка", "Вставь vless/hy2, URL подписки или Raw JSON")
             return
         if not self._servers:
-            messagebox.showwarning(
-                "Сервер",
-                "Сначала нажми «Загрузить», чтобы получить список серверов",
-            )
+            messagebox.showwarning("Сервер", "Сначала нажми «Загрузить»")
             return
         server = self._selected_server()
         if not server:
@@ -636,16 +708,20 @@ class App(ctk.CTk):
         if len(password) < 8:
             messagebox.showwarning("Пароль", "Пароль Wi‑Fi минимум 8 символов")
             return
+        if not is_admin():
+            messagebox.showerror("Админ", "Перезапусти приложение от имени администратора")
+            return
 
         wifi_name = self._selected_adapter_name()
         self._persist_settings()
         self._last_error_shown = ""
-        self._append_log("——— новый запуск ———")
-        self._append_log(f"Сервер: {server.remark} ({server.kind})")
-        self._append_log("Запрос прав администратора для сетевого сервиса...")
+        self._ui_log("INFO", "——— новый запуск ———")
+        self._ui_log("INFO", f"Сервер: {server.remark}")
+        self._ui_log("INFO", "Запуск сетевого сервиса…")
         self._set_busy(True)
-        # Prefer compact source for job: URL/link if short; omit huge JSON body
-        job_link = link if len(link) < 4000 and not link.lstrip().startswith("{") else ""
+        self._pulse_button(self.start_btn, cycles=2)
+
+        job_link = link if len(link) < 4000 and not link.lstrip().startswith(("{", "[")) else ""
         self._write_job(
             {
                 "action": "start",
@@ -669,7 +745,7 @@ class App(ctk.CTk):
     def on_stop(self) -> None:
         if self._busy and not self._running:
             return
-        self._append_log("Остановка...")
+        self._ui_log("INFO", "Остановка…")
         self._set_busy(True)
         try:
             (WORK / "stop.flag").write_text("1", encoding="utf-8")
@@ -686,7 +762,7 @@ class App(ctk.CTk):
             "Остановить раздачу, закрыть служебные процессы и выключить Wi‑Fi точку?",
         ):
             return
-        self._append_log("Принудительное завершение...")
+        self._ui_log("WARN", "Принудительное завершение…")
         self._set_busy(True)
         try:
             (WORK / "kill.flag").write_text("1", encoding="utf-8")
@@ -713,15 +789,6 @@ class App(ctk.CTk):
         JOB_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _spawn_elevated_job(self) -> bool:
-        import ctypes
-
-        if getattr(sys, "frozen", False):
-            exe = sys.executable
-            params = "--job"
-        else:
-            exe = sys.executable
-            params = f'"{Path(__file__).resolve().parent.parent / "main.py"}" --job'
-
         if is_admin():
             def worker() -> None:
                 from .elevated_job import run_job
@@ -730,6 +797,15 @@ class App(ctk.CTk):
 
             threading.Thread(target=worker, daemon=True).start()
             return True
+
+        import ctypes
+
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            params = "--job"
+        else:
+            exe = sys.executable
+            params = f'"{Path(__file__).resolve().parent.parent / "main.py"}" --job'
 
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, str(ROOT), 1)
         if rc <= 32:
@@ -765,6 +841,8 @@ class App(ctk.CTk):
                 self.start_btn.configure(state="disabled")
                 self.stop_btn.configure(state="normal")
                 self._busy = False
+                if not self._anim_after:
+                    self._pulse_status()
             elif state == "stopped":
                 self._running = False
                 self._set_status("Остановлено", PILL_IDLE)
@@ -779,7 +857,7 @@ class App(ctk.CTk):
                 self.stop_btn.configure(state="disabled")
                 if message and message != self._last_error_shown:
                     self._last_error_shown = message
-                    self._append_log(f"Ошибка: {message}")
+                    self._ui_log("ERROR", message)
             elif state in ("starting", "stopping", "killing"):
                 self._busy = True
                 label = {
@@ -793,10 +871,7 @@ class App(ctk.CTk):
 
     def _follow_log_from_end(self) -> None:
         ensure_dirs()
-        if LOG_FILE.exists():
-            self._log_offset = LOG_FILE.stat().st_size
-        else:
-            self._log_offset = 0
+        self._log_offset = LOG_FILE.stat().st_size if LOG_FILE.exists() else 0
 
     def _drain_log_file(self) -> None:
         if not LOG_FILE.exists():
@@ -814,7 +889,66 @@ class App(ctk.CTk):
         text = chunk.decode("utf-8", errors="replace")
         for line in text.splitlines():
             if line.strip():
-                self._append_log_ui(line)
+                self._ingest_engine_line(line)
+
+    def _ingest_engine_line(self, message: str) -> None:
+        level, text = self._classify_engine_line(message)
+        if self._log_mode == "brief" and level == "DEBUG":
+            return
+        if self._log_mode == "brief":
+            brief = self._briefify(text)
+            if brief is None:
+                return
+            text = brief
+        self._ui_log(level if level != "DEBUG" else "DEBUG", text)
+
+    def _classify_engine_line(self, message: str) -> tuple[str, str]:
+        msg = message.strip()
+        low = msg.lower()
+        if msg.startswith("[xray]") or msg.startswith("[tun2socks]"):
+            body = msg.split("]", 1)[-1].strip()
+            if any(x in low for x in ("error", "failed", "fatal", "ошиб")):
+                return "ERROR", body or msg
+            if "warn" in low:
+                return "WARN", body or msg
+            return "DEBUG", body or msg
+        if any(x in low for x in ("ошиб", "error", "failed", "fatal")):
+            return "ERROR", msg
+        if "warn" in low or "⚠" in msg:
+            return "WARN", msg
+        return "INFO", msg
+
+    def _briefify(self, text: str) -> str | None:
+        t = text.strip()
+        low = t.lower()
+        # drop noisy separators already handled
+        if re.search(r"физический uplink", low):
+            return "Uplink готов"
+        if re.search(r"прямой маршрут", low):
+            return "Маршрут к серверу готов"
+        if re.search(r"xray socks", low):
+            return "Xray core запущен"
+        if re.search(r"tun адаптер", low):
+            return "TUN инициализирован"
+        if re.search(r"tun готов", low):
+            return "TUN готов к раздаче"
+        if re.search(r"wi.?fi точка", low):
+            return re.sub(r".*SSID=", "Точка доступа создана · SSID=", t, flags=re.I)
+        if re.search(r"раздача включена", low):
+            return "Раздача включена"
+        if re.search(r"готово\.|ожидание подключений", low):
+            return "Ожидание подключений…"
+        if re.search(r"остановлено", low):
+            return "Остановлено"
+        if re.search(r"force kill", low):
+            return "Принудительно завершено"
+        if re.search(r"очистк|^cleanup:", low):
+            return None
+        if re.search(r"протокол:|сервер:|запуск", low):
+            return t
+        if len(t) <= 90 and not t.startswith("["):
+            return t
+        return None
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -831,39 +965,46 @@ class App(ctk.CTk):
             fg = "#1A0808"
         self.status_pill.configure(text=f"  {text}  ", fg_color=color, text_color=fg)
 
-    def _line_tag(self, message: str) -> str:
-        low = message.lower()
-        if "ошиб" in low or "error" in low or "failed" in low:
-            return "error"
-        if "warn" in low or "⚠" in message:
-            return "warn"
-        if "info" in low or "готово" in low or "запущен" in low or "✓" in message:
-            return "info"
-        if message.startswith("———") or message.startswith("["):
-            return "muted"
-        return "plain"
-
-    def _append_log_ui(self, message: str) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        # keep original if already looks timestamped from engine detail lines
-        if message.startswith("[") or "——" in message[:4]:
-            display = message
-        else:
-            display = f"{stamp}  {message}"
-        tag = self._line_tag(message)
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", display + "\n", tag)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
-
-    def _append_log(self, message: str) -> None:
+    def _ui_log(self, level: str, message: str) -> None:
         def ui() -> None:
-            self._append_log_ui(message)
+            self._append_log_ui(level, message)
 
         try:
             self.after(0, ui)
         except Exception:
             pass
+
+    def _append_log(self, message: str) -> None:
+        # compatibility for older call sites
+        level, text = self._classify_engine_line(message)
+        self._ui_log(level if level != "DEBUG" or self._log_mode == "debug" else "INFO", text)
+
+    def _append_log_ui(self, level: str, message: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        lvl = (level or "INFO").upper()
+        if lvl == "DEBUG" and self._log_mode != "debug":
+            return
+        if "——" in message:
+            tag_level = "sep"
+            lvl_disp = "INFO"
+        else:
+            tag_level = {
+                "INFO": "info",
+                "WARN": "warn",
+                "WARNING": "warn",
+                "ERROR": "error",
+                "DEBUG": "debug",
+            }.get(lvl, "info")
+            lvl_disp = "WARN" if lvl in ("WARN", "WARNING") else lvl
+
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", stamp, "time")
+        self.log_box.insert("end", " ")
+        self.log_box.insert("end", f"{lvl_disp:<5}", tag_level)
+        self.log_box.insert("end", " ")
+        self.log_box.insert("end", message + "\n", "msg" if tag_level != "sep" else "sep")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
 
     def on_close(self) -> None:
         self._persist_settings()
