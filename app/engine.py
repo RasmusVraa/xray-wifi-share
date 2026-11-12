@@ -22,6 +22,7 @@ from .netutil import (
     remove_host_routes,
     resolve_ipv4,
 )
+from .healthcheck import socks5_http_204
 from .paths import BIN, STATE_FILE, TUN2SOCKS_EXE, XRAY_CONFIG, XRAY_EXE, ensure_dirs
 from .procutil import kill_our_share_processes, kill_supervisor
 from .remnawave import parse_servers
@@ -53,6 +54,9 @@ class _RuntimeState:
     bypass_ips: list[str] = field(default_factory=list)
     tun_adapter: str | None = None
     private_adapter: str | None = None
+    ssid: str = ""
+    password: str = ""
+    parsed: ParsedLink | None = None
 
 
 class Engine:
@@ -63,6 +67,8 @@ class Engine:
         self._running = False
         self._lock = threading.Lock()
         self._state = _RuntimeState()
+        self._last_req: StartRequest | None = None
+        self._reconnect_count = 0
 
     @property
     def running(self) -> bool:
@@ -123,15 +129,48 @@ class Engine:
             self._running = False
             self._log("FORCE KILL завершён")
 
+    def check_health(self) -> tuple[bool, str]:
+        """Return (ok, detail). Safe to call from supervisor loop."""
+        if not self._running:
+            return False, "not running"
+        if self._xray is None or self._xray.poll() is not None:
+            return False, "xray process down"
+        if self._tun is None or self._tun.poll() is not None:
+            return False, "tun2socks process down"
+        try:
+            import socket
+
+            with socket.create_connection((SOCKS_HOST, SOCKS_PORT), timeout=1.5):
+                pass
+        except OSError as exc:
+            return False, f"socks closed: {exc}"
+
+        ok, detail = socks5_http_204(SOCKS_HOST, SOCKS_PORT, timeout=8.0)
+        if not ok:
+            return False, f"tunnel probe failed: {detail}"
+        return True, "ok"
+
+    def reconnect_tunnel(self) -> None:
+        """Restart Xray + tun2socks without tearing down SoftAP when possible."""
+        with self._lock:
+            if not self._running or not self._last_req:
+                raise RuntimeError("Нечего переподключать")
+            self._reconnect_unlocked(self._last_req)
+
     def _start_unlocked(self, req: StartRequest) -> None:
         ensure_dirs()
         self.prepare_binaries()
+        self._last_req = req
+        self._reconnect_count = 0
 
         uplink = get_physical_uplink()
         self._state.uplink = uplink
+        self._state.ssid = req.ssid
+        self._state.password = req.password
         self._log(f"Физический uplink: {uplink.name} {uplink.ip} gw={uplink.gateway}")
 
         parsed = self._resolve_link(req)
+        self._state.parsed = parsed
         self._log(f"Протокол: {parsed.kind} ({parsed.remark})")
         if not parsed.server_host:
             raise RuntimeError("Не удалось вытащить адрес сервера из ссылки")
@@ -140,9 +179,7 @@ class Engine:
         self._state.bypass_ips = add_host_routes(ips, uplink)
         self._log(f"Прямой маршрут к серверу: {', '.join(self._state.bypass_ips)}")
 
-        cfg = build_xray_config(parsed, send_through=uplink.ip)
-        XRAY_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
+        self._write_xray_config(parsed, uplink.ip)
         self._start_xray()
         self._wait_port(SOCKS_HOST, SOCKS_PORT, timeout=15)
         self._log(f"Xray SOCKS {SOCKS_HOST}:{SOCKS_PORT} sendThrough={uplink.ip}")
@@ -153,25 +190,83 @@ class Engine:
         self._log(f"TUN адаптер: {tun_adapter}")
 
         # High-metric default on TUN so ICS can NAT Wi-Fi clients through VPN,
-        # while PC still prefers Happ/Ethernet (lower metric).
-        prepare_tun_for_ics(tun_adapter, ip=TUN_IP, gateway=TUN_GW, metric=9000)
+        # while PC still prefers Happ/Ethernet (lower metric). MTU 1280 for Discord/UDP.
+        prepare_tun_for_ics(tun_adapter, ip=TUN_IP, gateway=TUN_GW, metric=9000, mtu=1280)
         self._log(f"TUN готов к раздаче: {TUN_IP} (ПК продолжает обычный интернет)")
 
         hs = hotspot.configure_and_start(req.ssid, req.password)
         self._state.private_adapter = hs.private_adapter
         self._log(f"Wi‑Fi точка: SSID={hs.ssid}  адаптер={hs.private_adapter}")
 
-        public = ics.resolve_public([tun_adapter, TUN_NAME])
-        private = ics.resolve_private([hs.private_adapter])
-        self._log(f"ICS: public={public} | private={private}")
-        ics.enable_sharing(public, private)
-        # Re-assert after ICS (Windows sometimes rewrites routes/metrics)
-        prepare_tun_for_ics(tun_adapter, ip=TUN_IP, gateway=TUN_GW, metric=9000)
+        self._apply_ics(tun_adapter, hs.private_adapter)
+        self._log("Готово. Подключай устройство к Wi‑Fi точке.")
+        self._log("Ожидание подключений…")
+
+    def _reconnect_unlocked(self, req: StartRequest) -> None:
+        self._reconnect_count += 1
+        self._log(f"Переподключение туннеля #{self._reconnect_count}…")
+
+        uplink = get_physical_uplink()
+        self._state.uplink = uplink
+        parsed = self._state.parsed or self._resolve_link(req)
+        self._state.parsed = parsed
+
+        try:
+            ips = resolve_ipv4(parsed.server_host)
+            self._state.bypass_ips = add_host_routes(ips, uplink)
+        except Exception as exc:
+            self._log(f"Bypass refresh: {exc}")
+
+        self._kill(self._tun)
+        self._tun = None
+        self._kill(self._xray)
+        self._xray = None
+        time.sleep(0.4)
+
+        self._write_xray_config(parsed, uplink.ip)
+        self._start_xray()
+        self._wait_port(SOCKS_HOST, SOCKS_PORT, timeout=15)
+        self._start_tun(uplink.name)
+        tun_adapter = self._wait_tun_adapter(timeout=20)
+        self._state.tun_adapter = tun_adapter
+        prepare_tun_for_ics(tun_adapter, ip=TUN_IP, gateway=TUN_GW, metric=9000, mtu=1280)
+
+        private = self._state.private_adapter
+        if private:
+            try:
+                self._apply_ics(tun_adapter, private)
+            except Exception as exc:
+                self._log(f"ICS re-apply: {exc}")
+                # SoftAP may have dropped — restart hotspot
+                try:
+                    hs = hotspot.configure_and_start(req.ssid, req.password)
+                    self._state.private_adapter = hs.private_adapter
+                    self._apply_ics(tun_adapter, hs.private_adapter)
+                except Exception as exc2:
+                    self._log(f"Hotspot recovery failed: {exc2}")
+                    raise
+
         if self._state.bypass_ips and self._state.uplink:
             add_host_routes(self._state.bypass_ips, self._state.uplink)
 
+        ok, detail = socks5_http_204(SOCKS_HOST, SOCKS_PORT, timeout=10.0)
+        if not ok:
+            raise RuntimeError(f"После reconnect туннель мёртв: {detail}")
+        self._log("Туннель восстановлен")
+
+    def _write_xray_config(self, parsed: ParsedLink, send_through: str) -> None:
+        cfg = build_xray_config(parsed, send_through=send_through)
+        XRAY_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _apply_ics(self, tun_adapter: str, private_adapter: str) -> None:
+        public = ics.resolve_public([tun_adapter, TUN_NAME])
+        private = ics.resolve_private([private_adapter])
+        self._log(f"ICS: public={public} | private={private}")
+        ics.enable_sharing(public, private)
+        prepare_tun_for_ics(tun_adapter, ip=TUN_IP, gateway=TUN_GW, metric=9000, mtu=1280)
+        if self._state.bypass_ips and self._state.uplink:
+            add_host_routes(self._state.bypass_ips, self._state.uplink)
         self._log(f"Раздача включена: {public} → {private}")
-        self._log("Готово. Подключай устройство к Wi‑Fi точке.")
 
     def _resolve_link(self, req: StartRequest) -> ParsedLink:
         if isinstance(req.outbound, dict) and req.outbound:

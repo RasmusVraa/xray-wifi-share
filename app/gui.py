@@ -1068,6 +1068,12 @@ class App(ctk.CTk):
             return "Раздача включена"
         if re.search(r"готово\.|ожидание подключений", low):
             return "Ожидание подключений…"
+        if re.search(r"переподключен", low):
+            return t if "туннель" in low or "переподключ" in low else "Туннель переподключён"
+        if re.search(r"туннель восстановлен", low):
+            return "Туннель восстановлен"
+        if re.search(r"health:|tunnel probe", low):
+            return None if self._log_mode == "brief" else t
         if re.search(r"остановлено", low):
             return "Остановлено"
         if re.search(r"force kill", low):

@@ -319,10 +319,12 @@ def prepare_tun_for_ics(
     gateway: str = "10.8.0.1",
     prefix: int = 24,
     metric: int = 9000,
+    mtu: int = 1280,
 ) -> None:
     """
     Make Wintun look like a usable ICS 'public' uplink without stealing PC default route.
     High interface/route metric keeps Happ/Ethernet preferred for the PC.
+    MTU 1280 helps Discord voice / UDP on SoftAP clients (PS5).
     """
     if "happ" in adapter_name.lower():
         return
@@ -338,13 +340,17 @@ Get-NetRoute -InterfaceIndex $ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorActio
   Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 
 New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress '{ip}' -PrefixLength {prefix} -ErrorAction Stop | Out-Null
-Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -InterfaceMetric {metric} -Forwarding Enabled -ErrorAction SilentlyContinue
+Set-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4 -InterfaceMetric {metric} -Forwarding Enabled -NlMtuBytes {mtu} -ErrorAction SilentlyContinue
+try {{ Set-NetIPInterface -InterfaceIndex $ifIndex -NlMtu {mtu} -ErrorAction SilentlyContinue }} catch {{}}
 New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $ifIndex -NextHop '{gateway}' -RouteMetric {metric} -ErrorAction SilentlyContinue | Out-Null
 
 # Fallback if NextHop route rejected (on-link)
 if (-not (Get-NetRoute -InterfaceIndex $ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)) {{
   route add 0.0.0.0 mask 0.0.0.0 {gateway} metric {metric} if $ifIndex | Out-Null
 }}
+
+# Also set adapter MTU (Wintun)
+try {{ netsh interface ipv4 set subinterface $ifIndex mtu={mtu} store=active | Out-Null }} catch {{}}
 """
     r = run_ps(ps)
     if r.returncode != 0:

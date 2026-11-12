@@ -18,8 +18,33 @@ def build_xray_config(parsed: ParsedLink, send_through: str | None = None) -> di
         # Bind dial-out to physical NIC IP so traffic does not enter Happ TUN by mistake
         outbound["sendThrough"] = send_through
 
+    # Keepalive helps long-lived Discord WS / PS5 sessions
+    stream = outbound.get("streamSettings")
+    if not isinstance(stream, dict):
+        stream = {}
+        outbound["streamSettings"] = stream
+    sockopt = stream.get("sockopt")
+    if not isinstance(sockopt, dict):
+        sockopt = {}
+        stream["sockopt"] = sockopt
+    sockopt.setdefault("tcpKeepAliveInterval", 30)
+    sockopt.setdefault("tcpKeepAliveIdle", 30)
+
+    direct: dict[str, Any] = {"tag": "direct", "protocol": "freedom"}
+    if send_through:
+        direct["sendThrough"] = send_through
+
     return {
         "log": {"loglevel": "warning"},
+        # DNS for sniffed domains — Discord / PS5 need reliable resolution through tunnel
+        "dns": {
+            "servers": [
+                "1.1.1.1",
+                "8.8.8.8",
+                "localhost",
+            ],
+            "queryStrategy": "UseIPv4",
+        },
         "inbounds": [
             {
                 "tag": "socks-in",
@@ -29,19 +54,25 @@ def build_xray_config(parsed: ParsedLink, send_through: str | None = None) -> di
                 "settings": {
                     "auth": "noauth",
                     "udp": True,
+                    # Advertise reachable UDP relay address for SOCKS5 ASSOCIATE
                     "ip": SOCKS_HOST,
                 },
                 "sniffing": {
                     "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
+                    # Do NOT sniff quic — breaks Discord voice / activity on consoles
+                    "destOverride": ["http", "tls"],
                     "routeOnly": True,
                 },
             }
         ],
         "outbounds": [
             outbound,
-            {"tag": "direct", "protocol": "freedom", **({"sendThrough": send_through} if send_through else {})},
+            direct,
             {"tag": "block", "protocol": "blackhole"},
+            {
+                "tag": "dns-out",
+                "protocol": "dns",
+            },
         ],
         "routing": {
             "domainStrategy": "AsIs",
@@ -49,8 +80,15 @@ def build_xray_config(parsed: ParsedLink, send_through: str | None = None) -> di
                 {
                     "type": "field",
                     "inboundTag": ["socks-in"],
+                    "port": 53,
+                    "network": "udp",
+                    "outboundTag": "dns-out",
+                },
+                {
+                    "type": "field",
+                    "inboundTag": ["socks-in"],
                     "outboundTag": outbound.get("tag") or "proxy",
-                }
+                },
             ],
         },
     }

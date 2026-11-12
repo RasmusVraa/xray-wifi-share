@@ -17,6 +17,11 @@ from .procutil import (
 STOP_FLAG = WORK / "stop.flag"
 KILL_FLAG = WORK / "kill.flag"
 
+HEALTH_INTERVAL_SEC = 5.0
+HEALTH_FAIL_THRESHOLD = 2
+RECONNECT_COOLDOWN_SEC = 8.0
+MAX_RECONNECT_STREAK = 8
+
 
 def _write_status(state: str, message: str = "") -> None:
     ensure_dirs()
@@ -61,6 +66,66 @@ def _hard_cleanup(engine: Engine, reason: str) -> None:
         kill_supervisor()
 
 
+def _supervise(engine: Engine) -> int:
+    """Keep share alive: health-check tunnel and auto-reconnect."""
+    fail_streak = 0
+    reconnect_streak = 0
+    next_check = time.time() + HEALTH_INTERVAL_SEC
+
+    while engine.running:
+        if KILL_FLAG.exists():
+            _append_log("Получен kill.flag")
+            _hard_cleanup(engine, "kill.flag")
+            clear_supervisor_pid()
+            _write_status("stopped", "Убито")
+            return 0
+        if STOP_FLAG.exists():
+            _append_log("Получен stop.flag")
+            break
+
+        now = time.time()
+        if now >= next_check:
+            next_check = now + HEALTH_INTERVAL_SEC
+            ok, detail = engine.check_health()
+            if ok:
+                if fail_streak:
+                    _append_log("Туннель снова OK")
+                fail_streak = 0
+                reconnect_streak = 0
+            else:
+                fail_streak += 1
+                _append_log(f"WARN health: {detail} ({fail_streak}/{HEALTH_FAIL_THRESHOLD})")
+                if fail_streak >= HEALTH_FAIL_THRESHOLD:
+                    reconnect_streak += 1
+                    if reconnect_streak > MAX_RECONNECT_STREAK:
+                        _append_log("ERROR слишком много reconnect — останавливаю")
+                        _hard_cleanup(engine, "health-giveup")
+                        clear_supervisor_pid()
+                        _write_status("error", f"Туннель недоступен: {detail}")
+                        return 1
+                    _write_status("starting", f"Переподключение #{reconnect_streak}…")
+                    try:
+                        engine.reconnect_tunnel()
+                        fail_streak = 0
+                        _write_status("running", "Раздача активна (reconnect)")
+                        _append_log("INFO туннель переподключён")
+                        time.sleep(RECONNECT_COOLDOWN_SEC)
+                        next_check = time.time() + HEALTH_INTERVAL_SEC
+                    except Exception as exc:
+                        _append_log(f"ERROR reconnect: {exc}")
+                        fail_streak = HEALTH_FAIL_THRESHOLD
+                        time.sleep(RECONNECT_COOLDOWN_SEC)
+                        next_check = time.time() + HEALTH_INTERVAL_SEC
+
+        time.sleep(0.35)
+
+    engine.stop()
+    kill_our_share_processes()
+    clear_supervisor_pid()
+    _write_status("stopped", "Остановлено")
+    return 0
+
+
 def run_job() -> int:
     ensure_dirs()
     if not JOB_FILE.exists():
@@ -103,22 +168,7 @@ def run_job() -> int:
                 )
             )
             _write_status("running", "Раздача активна")
-            while engine.running:
-                if KILL_FLAG.exists():
-                    _append_log("Получен kill.flag")
-                    _hard_cleanup(engine, "kill.flag")
-                    clear_supervisor_pid()
-                    _write_status("stopped", "Убито")
-                    return 0
-                if STOP_FLAG.exists():
-                    _append_log("Получен stop.flag")
-                    break
-                time.sleep(0.35)
-            engine.stop()
-            kill_our_share_processes()
-            clear_supervisor_pid()
-            _write_status("stopped", "Остановлено")
-            return 0
+            return _supervise(engine)
 
         if action == "stop":
             STOP_FLAG.write_text("1", encoding="utf-8")
