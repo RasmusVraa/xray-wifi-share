@@ -18,5 +18,5 @@ mkdir "dist\installer" 2>nul
 if errorlevel 1 exit /b 1
 
 echo.
-echo Installer: dist\installer\XrayWifiShare-Setup-1.1.3.exe
+echo Installer: dist\installer\XrayWifiShare-Setup-1.1.4.exe
 endlocal

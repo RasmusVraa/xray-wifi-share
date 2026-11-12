@@ -152,24 +152,42 @@ class App(ctk.CTk):
         self.link_entry.pack(side="left", fill="x", expand=True)
         self.paste_btn = ctk.CTkButton(
             link_row,
-            text="⧉  Вставить",
-            width=108,
+            text="⧉",
+            width=42,
             height=42,
             fg_color=STROKE,
             hover_color="#364257",
+            font=ctk.CTkFont(size=16),
             command=self.paste_link,
         )
         self.paste_btn.pack(side="left", padx=(8, 0))
+        self._tooltip(self.paste_btn, "Вставить из буфера")
+
         self.load_btn = ctk.CTkButton(
             link_row,
-            text="Загрузить",
-            width=108,
+            text="↻",
+            width=42,
             height=42,
             fg_color=STROKE,
             hover_color="#364257",
+            font=ctk.CTkFont(size=18),
             command=self.load_servers,
         )
-        self.load_btn.pack(side="left", padx=(8, 0))
+        self.load_btn.pack(side="left", padx=(6, 0))
+        self._tooltip(self.load_btn, "Загрузить список серверов")
+
+        self.clear_link_btn = ctk.CTkButton(
+            link_row,
+            text="✕",
+            width=42,
+            height=42,
+            fg_color=STROKE,
+            hover_color="#2A1C1C",
+            font=ctk.CTkFont(size=15),
+            command=self.clear_link,
+        )
+        self.clear_link_btn.pack(side="left", padx=(6, 0))
+        self._tooltip(self.clear_link_btn, "Очистить поле")
 
         ctk.CTkLabel(
             left,
@@ -518,12 +536,56 @@ class App(ctk.CTk):
         self.show_pw_btn.configure(text="Скрыть" if self._show_password else "Показать")
         self._persist_settings()
 
+    def _tooltip(self, widget, text: str) -> None:
+        tip: ctk.CTkToplevel | None = None
+
+        def show(_event=None) -> None:
+            nonlocal tip
+            if tip is not None:
+                return
+            tip = ctk.CTkToplevel(self)
+            tip.withdraw()
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            label = ctk.CTkLabel(
+                tip,
+                text=f"  {text}  ",
+                fg_color="#1E2633",
+                text_color=TEXT,
+                corner_radius=6,
+                font=ctk.CTkFont(size=11),
+            )
+            label.pack(padx=2, pady=2)
+            tip.update_idletasks()
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            tip.geometry(f"+{x}+{y}")
+            tip.deiconify()
+
+        def hide(_event=None) -> None:
+            nonlocal tip
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                tip = None
+
+        widget.bind("<Enter>", show, add="+")
+        widget.bind("<Leave>", hide, add="+")
+
+    def clear_link(self) -> None:
+        self.link_entry.delete(0, "end")
+        self._set_servers([], hint="Поле очищено — вставь ссылку / URL / JSON")
+        self._persist_settings()
+        self._ui_log("INFO", "Поле ссылки очищено")
+
     def paste_link(self) -> None:
         text = self._clipboard_text()
         if not text:
             messagebox.showinfo(
                 "Буфер",
-                "Не удалось прочитать буфер.\nСкопируй ссылку ещё раз и нажми «Вставить».",
+                "Не удалось прочитать буфер.\nСкопируй ссылку ещё раз и нажми ⧉.",
             )
             return
         self.link_entry.delete(0, "end")
@@ -568,7 +630,7 @@ class App(ctk.CTk):
             def done() -> None:
                 if token != self._parse_token:
                     return
-                self.load_btn.configure(state="normal", text="Загрузить")
+                self.load_btn.configure(state="normal", text="↻")
                 if err:
                     self._set_servers([], hint=f"Не разобрать: {err}")
                     self._ui_log("ERROR", f"Подписка: {err}")
@@ -714,7 +776,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Ссылка", "Вставь vless/hy2, URL подписки или Raw JSON")
             return
         if not self._servers:
-            messagebox.showwarning("Сервер", "Сначала нажми «Загрузить»")
+            messagebox.showwarning("Сервер", "Сначала загрузи список серверов (↻)")
             return
         server = self._selected_server()
         if not server:
