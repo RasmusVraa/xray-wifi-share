@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+runtime/bin/
+runtime/work/
+build/
+dist/
+*.spec.bak
+*.log
+.DS_Store
+config.local.json
+*.exe
+!docs/**
