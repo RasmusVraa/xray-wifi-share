@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from contextlib import contextmanager
+from typing import Iterable, Iterator
 
 try:
+    import pythoncom  # type: ignore
     import win32com.client  # type: ignore
 except ImportError:  # pragma: no cover
+    pythoncom = None  # type: ignore
     win32com = None  # type: ignore
 
 
@@ -14,8 +17,32 @@ ICSS_PRIVATE = 1
 
 
 def _require_win32() -> None:
-    if win32com is None:
+    if win32com is None or pythoncom is None:
         raise RuntimeError("Нужен пакет pywin32 (pip install pywin32)")
+
+
+@contextmanager
+def _com_initialized() -> Iterator[None]:
+    """ICS COM must be initialized on the calling thread (job runs in a worker)."""
+    _require_win32()
+    initialized = False
+    try:
+        # COINIT_APARTMENTTHREADED — HNetCfg expects STA
+        hr = pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+        # S_OK (0) or S_FALSE (1) — both mean COM is usable on this thread
+        initialized = True
+        _ = hr
+    except Exception as exc:
+        # Already initialized with different mode, etc.
+        raise RuntimeError(f"CoInitialize failed: {exc}") from exc
+    try:
+        yield
+    finally:
+        if initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
 
 def _connections():
@@ -29,50 +56,58 @@ def _connections():
 
 
 def disable_all_sharing() -> None:
-    for _hnet, _conn, _props, cfg in _connections():
-        try:
-            if cfg.SharingEnabled:
-                cfg.DisableSharing()
-        except Exception:
-            pass
+    with _com_initialized():
+        for _hnet, _conn, _props, cfg in _connections():
+            try:
+                if cfg.SharingEnabled:
+                    cfg.DisableSharing()
+            except Exception:
+                pass
 
 
 def list_shareable_names() -> list[str]:
     names: list[str] = []
-    for _hnet, _conn, props, _cfg in _connections():
-        try:
-            names.append(str(props.Name))
-        except Exception:
-            continue
+    with _com_initialized():
+        for _hnet, _conn, props, _cfg in _connections():
+            try:
+                names.append(str(props.Name))
+            except Exception:
+                continue
     return names
 
 
 def enable_sharing(public_name: str, private_name: str) -> None:
     """Share public_name (VPN TUN) to private_name (hotspot)."""
-    _require_win32()
-    disable_all_sharing()
+    with _com_initialized():
+        # disable inside same COM apartment
+        for _hnet, _conn, _props, cfg in _connections():
+            try:
+                if cfg.SharingEnabled:
+                    cfg.DisableSharing()
+            except Exception:
+                pass
 
-    public_cfg = None
-    private_cfg = None
-    seen: list[str] = []
+        public_cfg = None
+        private_cfg = None
+        seen: list[str] = []
 
-    for _hnet, _conn, props, cfg in _connections():
-        name = str(props.Name)
-        seen.append(name)
-        if name == public_name:
-            public_cfg = cfg
-        elif name == private_name:
-            private_cfg = cfg
+        for _hnet, _conn, props, cfg in _connections():
+            name = str(props.Name)
+            seen.append(name)
+            if name == public_name:
+                public_cfg = cfg
+            elif name == private_name:
+                private_cfg = cfg
 
-    if public_cfg is None or private_cfg is None:
-        raise RuntimeError(
-            "Не найдены адаптеры для ICS.\n"
-            f"Искал public='{public_name}', private='{private_name}'.\n"
-            f"Доступны: {', '.join(seen)}"
-        )
+        if public_cfg is None or private_cfg is None:
+            raise RuntimeError(
+                "Не найдены адаптеры для ICS.\n"
+                f"Искал public='{public_name}', private='{private_name}'.\n"
+                f"Доступны: {', '.join(seen)}"
+            )
 
-    public_cfg.EnableSharing(ICSS_PUBLIC)
-    private_cfg.EnableSharing(ICSS_PRIVATE)
+        public_cfg.EnableSharing(ICSS_PUBLIC)
+        private_cfg.EnableSharing(ICSS_PRIVATE)
 
 
 def _norm(s: str) -> str:

@@ -376,6 +376,18 @@ class App(ctk.CTk):
             text_color=MUTED,
             command=self.clear_log,
         ).pack(side="right")
+        ctk.CTkButton(
+            log_head,
+            text="⧉  Копировать",
+            width=120,
+            height=28,
+            fg_color="transparent",
+            border_width=1,
+            border_color=STROKE,
+            hover_color="#222836",
+            text_color=MUTED,
+            command=self.copy_log,
+        ).pack(side="right", padx=(0, 8))
 
         self.log_box = ctk.CTkTextbox(
             log_in,
@@ -395,7 +407,13 @@ class App(ctk.CTk):
         tb.tag_configure("debug", foreground=HINT)
         tb.tag_configure("msg", foreground="#E8EDF5")
         tb.tag_configure("sep", foreground=HINT)
-        self.log_box.configure(state="disabled")
+        # Keep editable state so selection/copy works; block typing.
+        tb.bind("<Key>", self._log_block_edit)
+        tb.bind("<<Paste>>", lambda _e: "break")
+        tb.bind("<Control-a>", self._log_select_all)
+        tb.bind("<Control-A>", self._log_select_all)
+        tb.bind("<Control-c>", self._log_copy_selection)
+        tb.bind("<Control-C>", self._log_copy_selection)
 
         self._apply_settings()
         self.ssid_entry.bind("<FocusOut>", lambda _e: self._persist_settings())
@@ -780,9 +798,59 @@ class App(ctk.CTk):
         except Exception:
             pass
         self._log_offset = 0
-        self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
+
+    def copy_log(self) -> None:
+        text = self.log_box.get("1.0", "end-1c")
+        if not text.strip():
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self._ui_log("INFO", "Лог скопирован в буфер")
+        except Exception as exc:
+            messagebox.showerror("Буфер", f"Не удалось скопировать лог: {exc}")
+
+    def _log_block_edit(self, event) -> str | None:
+        # Allow shortcuts / navigation, block typing
+        if event.state & 0x4:  # Control
+            return None
+        if event.keysym in (
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Prior",
+            "Next",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+            "Escape",
+            "Tab",
+        ):
+            return None
+        return "break"
+
+    def _log_select_all(self, _event=None):
+        tb = self.log_box._textbox  # noqa: SLF001
+        tb.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _log_copy_selection(self, _event=None):
+        try:
+            tb = self.log_box._textbox  # noqa: SLF001
+            text = tb.selection_get()
+        except Exception:
+            text = self.log_box.get("1.0", "end-1c")
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        return "break"
 
     def _write_job(self, payload: dict) -> None:
         ensure_dirs()
@@ -997,14 +1065,12 @@ class App(ctk.CTk):
             }.get(lvl, "info")
             lvl_disp = "WARN" if lvl in ("WARN", "WARNING") else lvl
 
-        self.log_box.configure(state="normal")
         self.log_box.insert("end", stamp, "time")
         self.log_box.insert("end", " ")
         self.log_box.insert("end", f"{lvl_disp:<5}", tag_level)
         self.log_box.insert("end", " ")
         self.log_box.insert("end", message + "\n", "msg" if tag_level != "sep" else "sep")
         self.log_box.see("end")
-        self.log_box.configure(state="disabled")
 
     def on_close(self) -> None:
         self._persist_settings()
