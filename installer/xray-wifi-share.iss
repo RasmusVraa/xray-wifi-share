@@ -1,6 +1,6 @@
 ; Inno Setup script — Xray Wi-Fi Share
 #define MyAppName "Xray Wi-Fi Share"
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.2.3"
 #define MyAppPublisher "Xray Wi-Fi Share"
 #define MyAppExeName "XrayWifiShare.exe"
 #define MyAppURL "https://github.com/RasmusVraa/xray-wifi-share"

@@ -47,11 +47,11 @@
 ## Установка
 
 1. Скачай установщик из [Releases](https://github.com/RasmusVraa/xray-wifi-share/releases/latest):  
-   **`XrayWifiShare-Setup-1.2.2.exe`**
+   **`XrayWifiShare-Setup-1.2.3.exe`**
 2. Установи как обычную программу
 3. Запусти **Xray Wi‑Fi Share** из меню Пуск (подтверди UAC)
 
-> Portable‑сборка без установщика тоже есть в релизе: `XrayWifiShare-portable-1.2.2.zip`.
+> Portable‑сборка без установщика тоже есть в релизе: `XrayWifiShare-portable-1.2.3.zip`.
 
 ## Быстрый старт
 

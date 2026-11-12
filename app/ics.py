@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import time
@@ -20,17 +21,32 @@ except ImportError:  # pragma: no cover
 ICSS_PUBLIC = 0
 ICSS_PRIVATE = 1
 
-# Out-of-process STA script — in-process pywin32 often hits 0x80040201 on Win10/11
+# HNetCfg EnableSharing is notoriously unreliable from 64-bit processes (0x80040201).
+# Prefer 32-bit PowerShell STA — same bitness as working ICS Manager tools.
+_PS32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+_PS64 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+
+
+def _powershell_exe() -> str:
+    if _PS32.is_file():
+        return str(_PS32)
+    if _PS64.is_file():
+        return str(_PS64)
+    return "powershell"
+
+
+# Out-of-process STA script
 _ICS_PS = r"""
 param(
   [Parameter(Mandatory=$true)][string]$PublicName,
-  [Parameter(Mandatory=$true)][string]$PrivateName
+  [Parameter(Mandatory=$true)][string]$PrivateName,
+  [ValidateSet('pub-priv','priv-pub')][string]$Order = 'pub-priv'
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 function Write-Result($ok, $msg) {
-  $obj = @{ ok = [bool]$ok; message = [string]$msg }
+  $obj = @{ ok = [bool]$ok; message = [string]$msg; bitness = [IntPtr]::Size * 8 }
   $obj | ConvertTo-Json -Compress
 }
 
@@ -42,7 +58,7 @@ function Ensure-SharedAccess {
   }
   if ($svc.Status -ne 'Running') {
     Start-Service SharedAccess -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 900
+    Start-Sleep -Milliseconds 1200
   }
 }
 
@@ -81,63 +97,107 @@ function NameMatch([string]$a, [string]$b) {
   return $false
 }
 
-try {
-  Ensure-SharedAccess
-  regsvr32 /s hnetcfg.dll | Out-Null
-  Cleanup-HomeNet
-
-  $hnet = New-Object -ComObject HNetCfg.HNetShare
-
-  function Disable-All([object]$mgr) {
-    foreach ($conn in $mgr.EnumEveryConnection) {
-      try {
-        $cfg = $mgr.INetSharingConfigurationForINetConnection($conn)
-        if ($cfg.SharingEnabled) { $cfg.DisableSharing() }
-      } catch {}
-    }
+function Disable-All([object]$mgr) {
+  foreach ($conn in $mgr.EnumEveryConnection) {
+    try {
+      $cfg = $mgr.INetSharingConfigurationForINetConnection($conn)
+      if ($cfg.SharingEnabled) { $cfg.DisableSharing() }
+    } catch {}
   }
+}
 
-  Disable-All $hnet
-  Start-Sleep -Milliseconds 700
-
-  # Bounce SharedAccess to clear stuck event subscribers (0x80040201)
-  try {
-    Restart-Service SharedAccess -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
-    Ensure-SharedAccess
-  } catch {}
-
-  # Re-create COM after service bounce
-  $hnet = New-Object -ComObject HNetCfg.HNetShare
-  Disable-All $hnet
-  Start-Sleep -Milliseconds 500
-  Cleanup-HomeNet
-
+function Find-Cfgs([object]$mgr, [string]$pubName, [string]$privName) {
   $publicCfg = $null
   $privateCfg = $null
   $seen = New-Object System.Collections.Generic.List[string]
-
-  foreach ($conn in $hnet.EnumEveryConnection) {
-    $props = $hnet.NetConnectionProps($conn)
+  foreach ($conn in $mgr.EnumEveryConnection) {
+    $props = $mgr.NetConnectionProps($conn)
     $name = [string]$props.Name
     $seen.Add($name) | Out-Null
-    $cfg = $hnet.INetSharingConfigurationForINetConnection($conn)
-    if (NameMatch $name $PublicName) { $publicCfg = $cfg }
-    if (NameMatch $name $PrivateName) { $privateCfg = $cfg }
+    $cfg = $mgr.INetSharingConfigurationForINetConnection($conn)
+    if (NameMatch $name $pubName) { $publicCfg = $cfg }
+    if (NameMatch $name $privName) { $privateCfg = $cfg }
   }
+  return @{ public = $publicCfg; private = $privateCfg; seen = $seen }
+}
 
-  if ($null -eq $publicCfg -or $null -eq $privateCfg) {
-    Write-Result $false ("adapters not found public='$PublicName' private='$PrivateName' available=$($seen -join ', ')")
+try {
+  Ensure-SharedAccess
+  try { regsvr32 /s hnetcfg.dll | Out-Null } catch {}
+  Cleanup-HomeNet
+
+  $hnet = New-Object -ComObject HNetCfg.HNetShare
+  Disable-All $hnet
+  Start-Sleep -Milliseconds 800
+  Cleanup-HomeNet
+
+  # Soft bounce only if service looks wedged — full Restart can drop SoftAP
+  try {
+    $svc = Get-Service SharedAccess -ErrorAction SilentlyContinue
+    if ($null -ne $svc -and $svc.Status -ne 'Running') {
+      Start-Service SharedAccess -ErrorAction SilentlyContinue
+      Start-Sleep -Milliseconds 1200
+    }
+  } catch {}
+
+  $hnet = New-Object -ComObject HNetCfg.HNetShare
+  Disable-All $hnet
+  Start-Sleep -Milliseconds 500
+
+  $found = Find-Cfgs $hnet $PublicName $PrivateName
+  if ($null -eq $found.public -or $null -eq $found.private) {
+    Write-Result $false ("adapters not found public='$PublicName' private='$PrivateName' available=$($found.seen -join ', ')")
     exit 2
   }
 
-  # Order from working IcsManager: PUBLIC then PRIVATE
-  $publicCfg.EnableSharing(0)
-  Start-Sleep -Milliseconds 400
-  $privateCfg.EnableSharing(1)
+  $err1 = $null
+  try {
+    if ($Order -eq 'priv-pub') {
+      $found.private.EnableSharing(1)
+      Start-Sleep -Milliseconds 500
+      $found.public.EnableSharing(0)
+    } else {
+      $found.public.EnableSharing(0)
+      Start-Sleep -Milliseconds 500
+      $found.private.EnableSharing(1)
+    }
+  } catch {
+    $err1 = $_.Exception.Message
+  }
 
-  Write-Result $true 'ok'
-  exit 0
+  if ($null -eq $err1) {
+    Write-Result $true ("ok order=$Order")
+    exit 0
+  }
+
+  # Retry opposite order after fresh cleanup
+  Cleanup-HomeNet
+  $hnet = New-Object -ComObject HNetCfg.HNetShare
+  Disable-All $hnet
+  Start-Sleep -Milliseconds 700
+  $found = Find-Cfgs $hnet $PublicName $PrivateName
+  if ($null -eq $found.public -or $null -eq $found.private) {
+    Write-Result $false ("retry adapters missing; first=$err1")
+    exit 2
+  }
+
+  $alt = if ($Order -eq 'priv-pub') { 'pub-priv' } else { 'priv-pub' }
+  try {
+    if ($alt -eq 'priv-pub') {
+      $found.private.EnableSharing(1)
+      Start-Sleep -Milliseconds 500
+      $found.public.EnableSharing(0)
+    } else {
+      $found.public.EnableSharing(0)
+      Start-Sleep -Milliseconds 500
+      $found.private.EnableSharing(1)
+    }
+    Write-Result $true ("ok order=$alt after fail=$err1")
+    exit 0
+  } catch {
+    Write-Result $false ("EnableSharing failed ($Order then $alt): $err1 | $($_.Exception.Message)")
+    exit 1
+  }
 } catch {
   Write-Result $false $_.Exception.Message
   exit 1
@@ -154,15 +214,42 @@ def _star_suffix(name: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _run_ics_sta(public_name: str, private_name: str) -> None:
-    """Enable ICS in a clean PowerShell STA process (avoids Python COM 0x80040201)."""
+def _run_ps_command(ps: str, timeout: int = 60):
+    return run_cmd(
+        [
+            _powershell_exe(),
+            "-STA",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps,
+        ],
+        timeout=timeout,
+    )
+
+
+def _parse_json_result(raw: str) -> dict | None:
+    for line in reversed((raw or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{") and "ok" in line:
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def _run_ics_sta(public_name: str, private_name: str, order: str = "pub-priv") -> None:
+    """Enable ICS in a clean 32-bit PowerShell STA process."""
     with tempfile.TemporaryDirectory() as tmp:
         script = Path(tmp) / "enable_ics.ps1"
         script.write_text(_ICS_PS.lstrip("\n"), encoding="utf-8")
-        # -STA is critical for HNetCfg event subscribers
         r = run_cmd(
             [
-                "powershell",
+                _powershell_exe(),
                 "-STA",
                 "-NoProfile",
                 "-ExecutionPolicy",
@@ -173,27 +260,24 @@ def _run_ics_sta(public_name: str, private_name: str) -> None:
                 public_name,
                 "-PrivateName",
                 private_name,
+                "-Order",
+                order,
             ],
             timeout=120,
         )
     raw = (r.stdout or "").strip() or (r.stderr or "").strip()
-    data = None
-    for line in reversed(raw.splitlines()):
-        line = line.strip()
-        if line.startswith("{") and "ok" in line:
-            try:
-                data = json.loads(line)
-                break
-            except Exception:
-                continue
+    data = _parse_json_result(raw)
     if isinstance(data, dict) and data.get("ok"):
         return
     msg = ""
+    bitness = ""
     if isinstance(data, dict):
         msg = str(data.get("message") or "")
+        if data.get("bitness"):
+            bitness = f" [ps={data.get('bitness')}-bit]"
     if not msg:
         msg = raw or f"exit={r.returncode}"
-    raise RuntimeError(f"ICS STA failed: {msg}")
+    raise RuntimeError(f"ICS STA failed{bitness}: {msg}")
 
 
 def disable_all_sharing() -> None:
@@ -209,16 +293,26 @@ try {
     } catch {}
   }
 } catch {}
+try {
+  $opts = New-Object System.Management.PutOptions
+  $opts.Type = [System.Management.PutType]::UpdateOnly
+  $scope = New-Object System.Management.ManagementScope('root\Microsoft\HomeNet')
+  $scope.Connect()
+  $q = New-Object System.Management.ObjectQuery('SELECT * FROM HNet_ConnectionProperties')
+  $searcher = New-Object System.Management.ManagementObjectSearcher($scope, $q)
+  foreach ($entry in $searcher.Get()) {
+    $changed = $false
+    if ($entry['IsIcsPrivate']) { $entry['IsIcsPrivate'] = $false; $changed = $true }
+    if ($entry['IsIcsPublic'])  { $entry['IsIcsPublic']  = $false; $changed = $true }
+    if ($changed) { $entry.Put($opts) | Out-Null }
+  }
+} catch {}
 """
-    run_cmd(
-        ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-        timeout=60,
-    )
-    time.sleep(0.4)
+    _run_ps_command(ps, timeout=60)
+    time.sleep(0.5)
 
 
 def list_shareable_names() -> list[str]:
-    # Prefer STA process listing for consistent Cyrillic names
     ps = r"""
 $ErrorActionPreference='SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -229,10 +323,7 @@ foreach ($conn in $hnet.EnumEveryConnection) {
 }
 $names | ConvertTo-Json -Compress
 """
-    r = run_cmd(
-        ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-        timeout=45,
-    )
+    r = _run_ps_command(ps, timeout=45)
     try:
         data = json.loads((r.stdout or "").strip() or "[]")
         if isinstance(data, str):
@@ -241,7 +332,7 @@ $names | ConvertTo-Json -Compress
             return [str(x) for x in data]
     except Exception:
         pass
-    # fallback in-process
+    # fallback in-process (names only)
     names: list[str] = []
     if win32com is None:
         return names
@@ -279,10 +370,7 @@ foreach ($conn in $hnet.EnumEveryConnection) {
 }
 @{ public = $pub; private = $priv } | ConvertTo-Json -Compress
 """
-    r = run_cmd(
-        ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-        timeout=45,
-    )
+    r = _run_ps_command(ps, timeout=45)
     try:
         data = json.loads((r.stdout or "").strip() or "{}")
         return data.get("public"), data.get("private")
@@ -291,7 +379,7 @@ foreach ($conn in $hnet.EnumEveryConnection) {
 
 
 def enable_sharing(public_name: str, private_name: str) -> None:
-    """Share public (TUN) → private (SoftAP). Uses out-of-process STA PowerShell."""
+    """Share public (TUN) → private (SoftAP). Uses 32-bit STA PowerShell."""
     cur_pub, cur_priv = current_sharing()
     if cur_pub and cur_priv:
         if _norm(cur_pub) == _norm(public_name) and (
@@ -305,19 +393,25 @@ def enable_sharing(public_name: str, private_name: str) -> None:
             return
 
     last_err: Exception | None = None
+    orders = ("pub-priv", "priv-pub")
     for attempt in range(1, 4):
+        order = orders[(attempt - 1) % 2]
         try:
-            _run_ics_sta(public_name, private_name)
-            # verify
+            _run_ics_sta(public_name, private_name, order=order)
             cur_pub, cur_priv = current_sharing()
             if cur_pub and cur_priv:
                 return
-            # sometimes SharingConnectionType is flaky — accept if EnableSharing didn't throw
+            # EnableSharing didn't throw — accept even if type readout is flaky
             return
         except Exception as exc:
             last_err = exc
-            time.sleep(0.7 * attempt)
-    raise RuntimeError(f"ICS EnableSharing failed: {last_err}")
+            time.sleep(0.9 * attempt)
+            try:
+                disable_all_sharing()
+            except Exception:
+                pass
+    ps = _powershell_exe()
+    raise RuntimeError(f"ICS EnableSharing failed ({ps}): {last_err}")
 
 
 def find_name(candidates: Iterable[str], available: list[str] | None = None) -> str | None:

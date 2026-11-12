@@ -199,7 +199,7 @@ class Engine:
         self._log(f"Wi‑Fi точка: SSID={hs.ssid}  адаптер={hs.private_adapter}")
 
         # SoftAP vNIC needs a moment before HNetCfg accepts EnableSharing
-        time.sleep(1.2)
+        time.sleep(2.5)
         self._apply_ics(tun_adapter, hs.private_adapter)
         self._log("Готово. Подключай устройство к Wi‑Fi точке.")
         self._log("Ожидание подключений…")

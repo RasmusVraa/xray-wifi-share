@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 from .hwid import device_hwid
 from .links import ParsedLink, parse_proxy_input
 
-APP_UA = "XrayWifiShare/1.2.2"
+APP_UA = "XrayWifiShare/1.2.3"
 
 
 def _client_headers(*, prefer_json: bool = False) -> dict[str, str]:
