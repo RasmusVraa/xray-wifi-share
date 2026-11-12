@@ -86,12 +86,20 @@ def run_job() -> int:
             write_supervisor_pid()
 
             _write_status("starting", "Запуск...")
+            outbound = job.get("outbound")
+            if not isinstance(outbound, dict):
+                outbound = None
             engine.start(
                 StartRequest(
                     link=str(job.get("link") or ""),
                     wifi_adapter=str(job.get("wifi_adapter") or ""),
-                    ssid=str(job.get("ssid") or "VPN-Share"),
+                    ssid=str(job.get("ssid") or "Xray_WiFi_Share"),
                     password=str(job.get("password") or ""),
+                    outbound=outbound,
+                    remark=str(job.get("remark") or ""),
+                    kind=str(job.get("kind") or ""),
+                    server_host=str(job.get("server_host") or ""),
+                    server_port=int(job.get("server_port") or 0),
                 )
             )
             _write_status("running", "Раздача активна")

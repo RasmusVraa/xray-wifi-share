@@ -9,7 +9,7 @@ from typing import Callable
 
 from . import hotspot, ics
 from .deps import ensure_runtime
-from .links import parse_proxy_input
+from .links import ParsedLink, parse_proxy_input
 from .netutil import (
     Adapter,
     Uplink,
@@ -24,6 +24,7 @@ from .netutil import (
 )
 from .paths import BIN, STATE_FILE, TUN2SOCKS_EXE, XRAY_CONFIG, XRAY_EXE, ensure_dirs
 from .procutil import kill_our_share_processes, kill_supervisor
+from .remnawave import parse_servers
 from .xray_config import SOCKS_HOST, SOCKS_PORT, build_xray_config
 
 LogFn = Callable[[str], None]
@@ -39,6 +40,11 @@ class StartRequest:
     wifi_adapter: str
     ssid: str
     password: str
+    outbound: dict | None = None
+    remark: str = ""
+    kind: str = ""
+    server_host: str = ""
+    server_port: int = 0
 
 
 @dataclass
@@ -125,7 +131,7 @@ class Engine:
         self._state.uplink = uplink
         self._log(f"Физический uplink: {uplink.name} {uplink.ip} gw={uplink.gateway}")
 
-        parsed = parse_proxy_input(req.link)
+        parsed = self._resolve_link(req)
         self._log(f"Протокол: {parsed.kind} ({parsed.remark})")
         if not parsed.server_host:
             raise RuntimeError("Не удалось вытащить адрес сервера из ссылки")
@@ -166,6 +172,38 @@ class Engine:
 
         self._log(f"Раздача включена: {public} → {private}")
         self._log("Готово. Подключай устройство к Wi‑Fi точке.")
+
+    def _resolve_link(self, req: StartRequest) -> ParsedLink:
+        if isinstance(req.outbound, dict) and req.outbound:
+            host = req.server_host
+            port = int(req.server_port or 0)
+            if not host:
+                from .remnawave import host_port_from_outbound
+
+                host, port = host_port_from_outbound(req.outbound)
+            return ParsedLink(
+                kind=req.kind or str(req.outbound.get("protocol") or "custom"),
+                outbound=req.outbound,
+                remark=req.remark or str(req.outbound.get("tag") or "selected"),
+                server_host=host,
+                server_port=port,
+            )
+
+        text = (req.link or "").strip()
+        if not text:
+            raise RuntimeError("Нет ссылки / подписки / JSON")
+
+        try:
+            servers = parse_servers(text)
+        except Exception:
+            servers = []
+        if servers:
+            if len(servers) == 1:
+                return servers[0]
+            # elevated job without GUI selection: prefer first usable
+            return servers[0]
+
+        return parse_proxy_input(text)
 
     def _cleanup_unlocked(self) -> None:
         self._load_state()

@@ -16,11 +16,12 @@ def settings_dir() -> Path:
 SETTINGS_FILE = settings_dir() / "settings.json"
 
 DEFAULTS = {
-    "ssid": "VPN-Share",
+    "ssid": "Xray_WiFi_Share",
     "password": "",
     "link": "",
     "adapter": "",
     "show_password": False,
+    "selected_server": "",
 }
 
 
