@@ -10,18 +10,29 @@ from urllib.request import Request, urlopen
 from .hwid import device_hwid
 from .links import ParsedLink, parse_proxy_input
 
+APP_UA = "XrayWifiShare/1.1.5"
 
-def _http_get(url: str, headers: dict[str, str] | None = None) -> tuple[str, str, int]:
-    hdrs = {
-        "User-Agent": "v2rayN/6.40",
-        "Accept": "*/*",
+
+def _client_headers(*, prefer_json: bool = False) -> dict[str, str]:
+    """Own identity only — never spoof Happ/v2rayN (that creates extra HWID slots)."""
+    return {
+        "User-Agent": APP_UA,
+        "Accept": "application/json, text/plain, */*" if prefer_json else "*/*",
         "x-hwid": device_hwid(),
         "x-device-os": "Windows",
         "x-ver-os": "10",
         "x-device-model": "XrayWifiShare",
     }
+
+
+def _http_get(url: str, headers: dict[str, str] | None = None) -> tuple[str, str, int]:
+    hdrs = _client_headers()
     if headers:
         hdrs.update(headers)
+    # Always force our UA/HWID even if caller passed overrides by mistake
+    hdrs["User-Agent"] = APP_UA
+    hdrs["x-hwid"] = device_hwid()
+    hdrs["x-device-model"] = "XrayWifiShare"
     req = Request(url, headers=hdrs)
     with urlopen(req, timeout=45) as resp:
         ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -37,66 +48,38 @@ def _http_get(url: str, headers: dict[str, str] | None = None) -> tuple[str, str
 def _candidate_urls(url: str) -> list[str]:
     base = url.rstrip("/")
     out = [base]
-    # Remnawave optional JSON path
     if not base.lower().endswith(("/json", "/info")):
         out.append(base + "/json")
     return out
 
 
 def _fetch_subscription(url: str) -> str:
-    """Download subscription body. Prefer Happ JSON, then classic Base64."""
-    attempts: list[dict[str, str]] = [
-        {
-            "User-Agent": "Happ/3.5.0",
-            "Accept": "application/json",
-        },
-        {
-            "User-Agent": "v2rayN/6.40",
-            "Accept": "text/plain, */*",
-        },
-        {
-            "User-Agent": "v2rayNG/1.8.19",
-            "Accept": "*/*",
-        },
-        {
-            "User-Agent": "XrayWifiShare/1.1",
-            "Accept": "*/*",
-        },
-    ]
+    """One client identity + stable HWID. At most one successful request per path."""
     last_err: Exception | None = None
-    bodies: list[tuple[str, str]] = []
 
     for candidate in _candidate_urls(url):
-        for hdrs in attempts:
-            try:
-                body, ctype, status = _http_get(candidate, hdrs)
-            except HTTPError as exc:
-                last_err = exc
-                continue
-            except URLError as exc:
-                last_err = exc
-                continue
-            except Exception as exc:
-                last_err = exc
-                continue
-            body = (body or "").strip()
-            if not body or status >= 400:
-                continue
-            # Skip HTML subscription page
-            low = body[:200].lower()
-            if "<html" in low or "<!doctype html" in low:
-                continue
-            bodies.append((body, ctype))
-            if body.startswith("{") or body.startswith("["):
-                return body
-            if "json" in ctype:
-                return body
+        try:
+            body, ctype, status = _http_get(candidate, _client_headers(prefer_json=True))
+        except HTTPError as exc:
+            last_err = exc
+            continue
+        except URLError as exc:
+            last_err = exc
+            continue
+        except Exception as exc:
+            last_err = exc
+            continue
+        body = (body or "").strip()
+        if not body or status >= 400:
+            continue
+        low = body[:200].lower()
+        if "<html" in low or "<!doctype html" in low:
+            continue
+        return body
 
-    if bodies:
-        return bodies[0][0]
     if last_err:
         raise ValueError(f"Не удалось скачать подписку: {last_err}")
-    raise ValueError("Подписка пустая или вернула HTML/403 — вставь Raw JSON")
+    raise ValueError("Подписка пустая или 403 — вставь Raw JSON или разреши UA XrayWifiShare")
 
 
 def _looks_like_url(text: str) -> bool:
