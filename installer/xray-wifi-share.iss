@@ -1,6 +1,6 @@
 ; Inno Setup script — Xray Wi-Fi Share
 #define MyAppName "Xray Wi-Fi Share"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.1.2"
 #define MyAppPublisher "Xray Wi-Fi Share"
 #define MyAppExeName "XrayWifiShare.exe"
 #define MyAppURL "https://github.com/RasmusVraa/xray-wifi-share"
@@ -43,4 +43,6 @@ Name: "{group}\Удалить {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; postinstall по умолчанию идёт unelevated → CreateProcess 740 на requireAdministrator.
+; runascurrentuser: запуск с правами установщика (admin).
+Filename: "{app}\{#MyAppExeName}"; Description: "Запустить {#MyAppName}"; Flags: nowait postinstall skipifsilent runascurrentuser
